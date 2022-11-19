@@ -1,23 +1,38 @@
 #include "netlib.h"
 
+#ifdef _DEBUG
+std::mutex LOG_MUTEX;
+#endif
+
 using namespace std::chrono_literals;
 
 WSADATA wsa;
+bool WSAINIT = false;
 
-void net::init() {
-	LOG("net init");
+net::NetLib::NetLib() {
+
+	if(WSAINIT) return;
+
 #ifdef _DEBUG
 	APP_START_TIME = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 #endif
 
+	LOG("WSA startup");
 	if(WSAStartup(MAKEWORD(2, 2), &wsa) != NO_ERROR) {
 		LOG("error initializing WSA");
-	}
+	} else WSAINIT = true;
 
 }
 
+net::NetLib::~NetLib() {
+	if(WSAINIT) {
+		LOG("WSA cleanup");
+		WSACleanup();
+	}
+}
+
 byte net::IP4Octet(IP4 addr, unsigned int octet) {
-	return --octet > 3 ? 0 : ((addr >> (8 * octet)) & 0xff);
+	return --octet > 3 ? 0 : reinterpret_cast<byte *>(&addr)[octet];
 }
 
 net::IP4 net::strToIP4(const char *str) {
@@ -90,7 +105,7 @@ void net::TCPListener::accepterWorker() {
 
 		LOG("accepted %s:%hu", IP4ToStr(acceptedCon.sin_addr.s_addr).c_str(), ntohs(acceptedCon.sin_port));
 
-		std::shared_ptr<Connection> con = std::make_shared<Connection>(tmp_sockAccept, srvIn, acceptedCon);
+		std::shared_ptr<Connection> con = std::make_shared<Connection>(tmp_sockAccept);
 
 	}
 
@@ -102,12 +117,19 @@ void net::TCPListener::startServer(std::shared_ptr<net::Connection> con) {
 }
 
 net::Connection::Connection(IP4 addr, PORT port) {
+
+	initEvents();
+
 	m_sockConnected = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+	LOG("connecting to %s:%hu", IP4ToStr(addr).c_str(), port);
+
+	port = htons(port);
 
 	SOCKADDR_IN peerInfo;
 	peerInfo.sin_family = AF_INET;
 	peerInfo.sin_addr.s_addr = addr;
-	peerInfo.sin_port = htons(port);
+	peerInfo.sin_port = port;
 
 
 	int iResult = connect(m_sockConnected, reinterpret_cast<SOCKADDR *>(&peerInfo), sizeof(peerInfo));
@@ -124,16 +146,25 @@ net::Connection::Connection(IP4 addr, PORT port) {
 	getsockname(m_sockConnected, reinterpret_cast<SOCKADDR *>(&selfName), &namelen);
 
 	m_addrPeer = addr;
-	m_portPeer = peerInfo.sin_port;
+	m_portPeer = port;
 	m_addrSelf = selfName.sin_addr.s_addr;
 	m_portSelf = selfName.sin_port;
 
 	m_connected = true;
+	LOG("connected");
 
 }
 
-net::Connection::Connection(SOCKET s, SOCKADDR_IN self, SOCKADDR_IN peer) {
+net::Connection::Connection(SOCKET s) {
+
+	initEvents();
+
 	m_sockConnected = s;
+	SOCKADDR_IN self, peer;
+	int namelen = sizeof(self);
+	getsockname(s, reinterpret_cast<SOCKADDR *>(&self), &namelen);
+	namelen = sizeof(peer);
+	getpeername(s, reinterpret_cast<SOCKADDR *>(&peer), &namelen);
 	m_addrPeer = peer.sin_addr.s_addr;
 	m_portPeer = peer.sin_port;
 	m_addrSelf = self.sin_addr.s_addr;
@@ -142,8 +173,85 @@ net::Connection::Connection(SOCKET s, SOCKADDR_IN self, SOCKADDR_IN peer) {
 	m_connected = true;
 }
 
-net::Connection::~Connection() {}
+void net::Connection::initEvents() {
+	m_evt_data_avl = CreateEvent(NULL, FALSE, FALSE, nullptr);
+	m_evt_queue_avl = CreateEvent(NULL, FALSE, FALSE, nullptr);
+	m_evt_con_end = CreateEvent(NULL, FALSE, FALSE, nullptr);
+}
+
+net::Connection::~Connection() {
+	CloseHandle(m_evt_data_avl);
+	CloseHandle(m_evt_queue_avl);
+	CloseHandle(m_evt_con_end);
+	receiverThread.join();
+}
 
 
-void net::Connection::startReceiving() {}
+void net::Connection::startReceiving() {
+	if(m_connected && !receiverThread.joinable()) receiverThread = std::thread(&Connection::receiverWorker, this);
+}
 
+void net::Connection::pushData(const void *buffer, size_t size) {
+	send(m_sockConnected, reinterpret_cast<const char *>(buffer), size, 0);
+}
+
+size_t net::Connection::pullData(void *buffer, size_t size) {
+	m_mDataMod.lock();
+	size_t sizePulled = m_queue.pull(size, buffer);
+	SetEvent(m_evt_queue_avl);
+	if(!m_queue.size()) ResetEvent(m_evt_data_avl);
+	m_mDataMod.unlock();
+
+	return sizePulled;
+}
+
+void net::Connection::receiverWorker() {
+	
+	LOG("receiver worker started");
+
+	char recvBuffer[1024];
+	int recvSize = 0, resumeOffs = 0;
+	bool shouldStopListen = false;
+	while(true) {
+		if(recvSize == 0) {
+			resumeOffs = 0;
+			recvSize = recv(m_sockConnected, recvBuffer, 1024, 0);
+
+			if(recvSize <= 0) {
+				shouldStopListen = true;
+
+				if(recvSize == 0) {
+					LOG("connection closed by peer");
+				} else {
+					int err = WSAGetLastError();
+					LOG("recv error %i", err);
+				}
+			}
+
+			if(shouldStopListen) {
+				m_connected = false; // ?
+				SetEvent(m_evt_con_end); // ? {evt_listen_ended?}
+				break;
+			}
+
+		} else {
+			WaitForSingleObject(m_evt_queue_avl, 1000);
+		}
+
+		m_mDataMod.lock();
+		SetEvent(m_evt_data_avl);
+		size_t pushedSize = m_queue.push(recvSize, recvBuffer + resumeOffs);
+		recvSize -= pushedSize;
+		resumeOffs += pushedSize;
+		if(recvSize) ResetEvent(m_evt_queue_avl);
+		m_mDataMod.unlock();
+
+	}
+
+	LOG("receiver worker ended");
+}
+
+void net::Connection::awaitData(DWORD m) {
+	HANDLE events[2] = { m_evt_data_avl, m_evt_con_end };
+	WaitForMultipleObjects(2, events, false, m);
+}

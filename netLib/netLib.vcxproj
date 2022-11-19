@@ -166,6 +166,7 @@
     <ClInclude Include="include\netlib.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\carousel.cpp" />
     <ClCompile Include="src\netlib.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
