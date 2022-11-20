@@ -52,5 +52,3 @@ std::string net::IP4ToStr(IP4 addr) {
 	}
 	return buff;
 }
-
-

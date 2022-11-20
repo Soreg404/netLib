@@ -69,6 +69,10 @@ net::Connection::~Connection() {
 	CloseHandle(m_evt_queue_avl);
 	CloseHandle(m_evt_con_end);
 	if(receiverThread.joinable()) receiverThread.join();
+	if(m_sockConnected != INVALID_SOCKET) {
+		closesocket(m_sockConnected);
+		m_sockConnected = INVALID_SOCKET;
+	}
 }
 
 void net::Connection::startReceiving() {

@@ -6,6 +6,8 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <list>
+#include <queue>
 
 #include <WinSock2.h>
 #include <Ws2tcpip.h>
@@ -82,8 +84,8 @@ namespace net {
 		inline bool isConnected() const { return m_connected; }
 		inline operator bool() const { return m_connected; }
 
-		SOCKET m_sockConnected = 0;
 	private:
+		SOCKET m_sockConnected = 0;
 		bool m_connected = false;
 		IP4 m_addrSelf = 0, m_addrPeer = 0;
 		PORT m_portSelf = 0, m_portPeer = 0;
@@ -98,7 +100,9 @@ namespace net {
 		HANDLE m_evt_data_avl, m_evt_queue_avl, m_evt_con_end;
 	};
 
-	typedef void (*serverFunc)(const Connection &);
+	typedef std::shared_ptr<Connection> CON_PTR;
+
+	typedef int (serverFunc)(CON_PTR);
 
 	class TCPListener {
 
@@ -112,13 +116,34 @@ namespace net {
 		SOCKET m_sockListener = 0;
 
 		PORT m_port = 0;
-		serverFunc m_serverFunction = nullptr;
+		serverFunc *m_serverFunction = nullptr;
 
 		std::thread m_accepterThread;
-
 		void accepterWorker();
 
-		void startServer(std::shared_ptr<Connection> acceptedCon);
+		void startServer(SOCKET acceptedSocket);
+
+		struct Session {
+			Session() = default;
+			CON_PTR con;
+			std::thread worker;
+			inline ~Session() { if(worker.joinable()) worker.join(); }
+		};
+		std::mutex m_mSessionsAll;
+		std::list<Session> m_sessionsAll;
+		typedef std::list<Session>::iterator SES_IT;
+		SES_IT sesNew();
+
+		void serverMgrWorker(SES_IT session);
+
+		std::mutex m_mSessionsWTC; // how unfortunate name
+		std::queue<SES_IT> m_sessionsWaitingToClose;
+		void sesMarkClose(SES_IT session);
+
+		HANDLE m_evt_sesWTC;
+		std::atomic<bool> m_WTCWorkerShouldQuit = false;
+		std::thread m_closerThread;
+		void closerWorker();
 
 	};
 
