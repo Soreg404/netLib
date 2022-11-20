@@ -16,6 +16,8 @@ void conRecvWorker(net::Connection *con) {
 		buffer[con->pullData(buffer, 255)] = 0;
 		std::cout << (const char *)buffer;
 	}
+
+	LOG("con recv worker stop");
 }
 
 int main() {
